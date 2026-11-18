@@ -1,9 +1,6 @@
 # addons
 
-`addons/sky_3d/` is [Sky3D](https://github.com/TokisanGames/Sky3D) v2.1.0 as released, unmodified. It is not
-committed to this repository; fetch it from upstream after cloning:
-
-    python3 tools/fetch_sky3d.py
-
-The script downloads the pinned release from GitHub and places its `addons/sky_3d` folder here. Sky3D keeps its
-own MIT licence (`addons/sky_3d/LICENSE.txt`) and third-party notices (`addons/sky_3d/ThirdParty.md`).
+`addons/sky_3d` is a symlink to `../thirdparty/Sky3D/addons/sky_3d`: [Sky3D](https://github.com/TokisanGames/Sky3D)
+v2.1.0 as released, unmodified, from the upstream repository as a git submodule. After a clone without
+`--recurse-submodules`, run `git submodule update --init`. Sky3D keeps its own MIT licence
+(`addons/sky_3d/LICENSE.txt`) and third-party notices (`addons/sky_3d/ThirdParty.md`).

@@ -23,12 +23,15 @@ AI-assisted project, built with Claude (Anthropic); see [AI assistance](#ai-assi
 
 ## Running it
 
-Sky3D is not committed here: fetch it from upstream first (Python 3, no git needed):
+Sky3D comes in as a git submodule of upstream [TokisanGames/Sky3D](https://github.com/TokisanGames/Sky3D),
+pinned at v2.1.0. Clone with submodules:
 
-    python3 tools/fetch_sky3d.py
+    git clone --recurse-submodules git@github.com:Niekvdm/godot-volumetric-clouds-demo.git
 
-It downloads Sky3D v2.1.0 from [TokisanGames/Sky3D](https://github.com/TokisanGames/Sky3D) and places its
-`addons/sky_3d` folder in this project.
+(or run `git submodule update --init` in an existing clone). The submodule sits in `thirdparty/Sky3D`, and
+`addons/sky_3d` is a symlink to its `addons/sky_3d` folder. On Windows, enable git symlinks before cloning
+(`git config --global core.symlinks true`, with Developer Mode on), or copy
+`thirdparty/Sky3D/addons/sky_3d` to `addons/sky_3d` by hand.
 
 Open the folder in Godot 4.8 (Forward+, Vulkan) and run the main scene, `demo/demo.tscn`. It was
 built and checked on a Godot 4.8 beta build; earlier 4.x versions have not been tried. On the first
@@ -123,8 +126,9 @@ affect at 0 and the sky unrotated. The half-res cloud buffer is encoded around t
 - `src/sky/shaders/`: the volumetric sky shader the clouds are marched in.
 - `src/sky/atmosphere/`: the physical atmosphere (`SkyAtmosphere`). It attaches to Sky3D's dome from
   outside and needs no change to Sky3D.
-- `addons/sky_3d/`: Sky3D v2.1.0 as released, unmodified, fetched by `tools/fetch_sky3d.py` (not committed).
-- `tools/fetch_sky3d.py`: fetches Sky3D from upstream.
+- `addons/sky_3d`: a symlink to `thirdparty/Sky3D/addons/sky_3d`, Sky3D v2.1.0 as released, unmodified.
+- `thirdparty/Sky3D`: the upstream Sky3D repository as a git submodule, pinned at v2.1.0 (its own demo
+  project is ignored by Godot through `thirdparty/.gdignore`).
 - `docs/`: the guides to [the clouds](docs/clouds.md) and [the atmosphere](docs/atmosphere.md).
 
 The density and lighting build on published work: Schneider, "The Real-time Volumetric
