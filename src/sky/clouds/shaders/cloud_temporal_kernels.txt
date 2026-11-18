@@ -1,0 +1,354 @@
+// Temporal cloud pass kernels (CloudTemporal). Vulkan GLSL read
+// as TEXT and assembled by CloudTemporalGlsl — .txt, not .glsl, because the
+// editor's importer claims .glsl files as Godot shaders:
+//   TRACE   = #version 450, KERNEL_TRACE, CLOUD_COMPUTE, the globals header
+//             (CloudGlobals.TABLE), planet_atmosphere + cloud_field + cloud_light
+//             + cloud_march (the SHIPPED includes), then this file.
+//   RESOLVE = #version 450, KERNEL_RESOLVE, then this file.
+//   VELOCITY = #version 450, KERNEL_VELOCITY, then this file (#775).
+// ct_ray / ct_project_prev / the depth linearisation are LOCKSTEP with
+// CloudTemporalMath.ray_dir / project / scene_distance (test_cloud_temporal_math).
+// Screen uv (0, 0) is the top-left pixel; a camera render stores its buffers
+// top-down.
+
+#ifdef KERNEL_TRACE
+#define CT_FRAME_SET 1
+#else
+#define CT_FRAME_SET 0
+#endif
+
+// CloudTemporalMath.pack_frame.
+layout(set = CT_FRAME_SET, binding = 0, std140) uniform CtFrame {
+	vec4 cam_pos;  // origin, tan.x
+	vec4 cam_x;    // basis.x, tan.y
+	vec4 cam_y;    // basis.y, p22
+	vec4 cam_z;    // basis.z, p32
+	vec4 prev_pos; // previous origin, tan.x
+	vec4 prev_x;   // previous basis.x, tan.y
+	vec4 prev_y;
+	vec4 prev_z;
+	vec4 wind;     // drift since the previous frame (x, -, z), history valid (w)
+	vec4 sizes;    // history w, h, trace w, h
+	vec4 frame_a;  // internal w, h, lattice L, frame index
+	vec4 frame_b;  // lattice offset x, y, retain, sub-pixel jitter (history texels)
+	vec4 march;    // max steps, light samples, refreshes since the last reset, 1 = geometry keeps its own motion
+} F;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+vec3 ct_ray(vec2 uv) {
+	return normalize(F.cam_x.xyz * ((2.0 * uv.x - 1.0) * F.cam_pos.w)
+			+ F.cam_y.xyz * ((1.0 - 2.0 * uv.y) * F.cam_x.w) - F.cam_z.xyz);
+}
+
+#ifdef KERNEL_TRACE
+
+layout(set = 1, binding = 1) uniform sampler2D ct_depth;
+layout(rgba16f, set = 1, binding = 2) uniform restrict writeonly image2D ct_trace;
+
+// R4 increments (1/g^k, g the root of x^5 = x + 1): four independent low-
+// discrepancy walks over the four blue-noise channels. THIS pass integrates the
+// walk; TAA never did (sky pixels carry no motion vector in Godot).
+const vec4 CT_R4 = vec4(0.8566748839, 0.7338918566, 0.6287067210, 0.5385972572);
+
+void main() {
+	ivec2 j = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 tsize = ivec2(F.sizes.zw);
+	if (j.x >= tsize.x || j.y >= tsize.y) {
+		return;
+	}
+	ivec2 hsize = ivec2(F.sizes.xy);
+	int L = int(F.frame_a.z);
+	ivec2 p = min(j * L + ivec2(F.frame_b.xy), hsize - 1);
+	// Indexed by the HISTORY pixel, not the trace texel: the four pixels of a
+	// lattice block must not share a noise value, or their residual noise lines
+	// up into a fixed 2x2 checker.
+	vec4 bn = texelFetch(cloud_blue_noise, ivec2(mod(vec2(p), 64.0)), 0);
+	// The walk steps once per REFRESH of this pixel (every L^2 frames), not per frame: indexed by
+	// the frame, a pixel saw the walk at every 4th point, 4 x R4 mod 1 = (0.43, 0.94, 0.51, 0.15) —
+	// its light-sample jitter crept by -0.06 a refresh and its sub-pixel x took two values, so the
+	// history drifted on a slowly changing per-pixel bias (#775: still-frame twinkle 0.065 -> 0.053 %).
+	float refresh = floor(mod(F.frame_a.w, 16384.0) / float(L * L));
+	bn = fract(bn + refresh * CT_R4);
+	// Sub-pixel jitter inside the history pixel: the history integrates the
+	// footprint, so cloud edges come out antialiased.
+	vec2 uv = (vec2(p) + 0.5 + (bn.zw - 0.5) * F.frame_b.w) / vec2(hsize);
+	vec3 rd = ct_ray(uv);
+	ivec2 full = ivec2(F.frame_a.xy);
+	float d = texelFetch(ct_depth, clamp(ivec2(uv * F.frame_a.xy), ivec2(0), full - 1), 0).r;
+	float t_scene = 1e12;
+	if (d > 0.0) {
+		vec3 v = vec3((2.0 * uv.x - 1.0) * F.cam_pos.w, (1.0 - 2.0 * uv.y) * F.cam_x.w, 1.0);
+		t_scene = F.cam_z.w / (d + F.cam_y.w) * length(v);
+		// A foreground object (the scene before the clouds' shell) does not end the ray: the
+		// history holds the cloud behind it (cloud_trace_t_max, the rim round objects).
+		t_scene = cloud_trace_t_max(F.cam_pos.xyz, rd, t_scene);
+	}
+	CloudSample s = cloud_march_to(F.cam_pos.xyz, rd, t_scene, bn.x, bn.y, false,
+			int(F.march.x), int(F.march.y));
+	imageStore(ct_trace, j, vec4(s.key_w, s.amb_w, s.T, s.depth_m * 0.001));
+}
+
+#endif
+
+#if defined(KERNEL_RESOLVE) || defined(KERNEL_VELOCITY)
+
+// Where the direction d from the previous camera sat on its screen (uv, z = 1), or z = -1
+// behind it. A point at infinity (the open sky) is its direction alone.
+vec3 ct_project_prev_dir(vec3 d) {
+	float zf = -dot(d, F.prev_z.xyz);
+	if (zf <= 1e-4) {
+		return vec3(0.0, 0.0, -1.0);
+	}
+	float x = dot(d, F.prev_x.xyz) / zf / F.prev_pos.w;
+	float y = dot(d, F.prev_y.xyz) / zf / F.prev_x.w;
+	return vec3(0.5 + 0.5 * x, 0.5 - 0.5 * y, 1.0);
+}
+
+// Where world point w sat on the previous frame's screen.
+vec3 ct_project_prev(vec3 w) {
+	return ct_project_prev_dir(w - F.prev_pos.xyz);
+}
+
+#endif
+
+#ifdef KERNEL_RESOLVE
+
+layout(set = 0, binding = 1) uniform sampler2D ct_trace_tex;   // nearest, clamp
+layout(set = 0, binding = 2) uniform sampler2D ct_hist_prev;   // linear, clamp
+layout(rgba16f, set = 0, binding = 3) uniform restrict writeonly image2D ct_hist_out;
+layout(rgba16f, set = 0, binding = 4) uniform restrict writeonly image2D ct_view_out;
+// Refreshes each history pixel holds (#775), carried with it like the history. A pixel the camera
+// has just revealed starts from the 3x3 tent estimate, counted as this many samples.
+const float CT_AGE_PRIOR = 4.0;
+layout(set = 0, binding = 5) uniform sampler2D ct_age_prev;     // nearest, clamp
+layout(r16f, set = 0, binding = 6) uniform restrict writeonly image2D ct_age_out;
+
+// Five-tap Catmull-Rom (Jimenez 2016): detail
+// survives repeated history warps where bilinear would blur it a little every
+// frame.
+vec4 ct_history(vec2 uv, vec2 size) {
+	vec2 pos = uv * size;
+	vec2 c = floor(pos - 0.5) + 0.5;
+	vec2 f = pos - c;
+	vec2 w0 = f * (f * (-0.5 * f + 1.0) - 0.5);
+	vec2 w1 = f * f * (1.5 * f - 2.5) + 1.0;
+	vec2 w2 = f * (f * (-1.5 * f + 2.0) + 0.5);
+	vec2 w3 = f * f * (0.5 * f - 0.5);
+	vec2 w12 = w1 + w2;
+	vec2 t0 = (c - 1.0) / size;
+	vec2 t3 = (c + 2.0) / size;
+	vec2 t12 = (c + w2 / w12) / size;
+	float a = w12.x * w0.y;
+	float b = w0.x * w12.y;
+	float m = w12.x * w12.y;
+	float e = w3.x * w12.y;
+	float g = w12.x * w3.y;
+	vec4 r = textureLod(ct_hist_prev, vec2(t12.x, t0.y), 0.0) * a
+			+ textureLod(ct_hist_prev, vec2(t0.x, t12.y), 0.0) * b
+			+ textureLod(ct_hist_prev, t12, 0.0) * m
+			+ textureLod(ct_hist_prev, vec2(t3.x, t12.y), 0.0) * e
+			+ textureLod(ct_hist_prev, vec2(t12.x, t3.y), 0.0) * g;
+	return r / (a + b + m + e + g);
+}
+
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 hsize = ivec2(F.sizes.xy);
+	if (p.x >= hsize.x || p.y >= hsize.y) {
+		return;
+	}
+	ivec2 tsize = ivec2(F.sizes.zw);
+	int L = int(F.frame_a.z);
+	ivec2 o = ivec2(F.frame_b.xy);
+	bool fresh = (p.x % L) == o.x && (p.y % L) == o.y;
+	// Where this history pixel sits on the trace grid (integer when fresh).
+	vec2 src = (vec2(p) - vec2(o)) / float(L);
+	ivec2 c = clamp(ivec2(round(src)), ivec2(0), tsize - 1);
+	vec4 central = texelFetch(ct_trace_tex, c, 0);
+	vec4 cur = central;
+	if (!fresh) {
+		// Not traced this frame: a depth- and opacity-aware bilinear of the four
+		// traced neighbours (only used when there is no history to carry).
+		ivec2 b = ivec2(floor(src));
+		vec2 fr = src - vec2(b);
+		vec4 acc = vec4(0.0);
+		float ws = 0.0;
+		for (int y = 0; y < 2; y++) {
+			for (int x = 0; x < 2; x++) {
+				vec4 tap = texelFetch(ct_trace_tex, clamp(b + ivec2(x, y), ivec2(0), tsize - 1), 0);
+				float wb = (x == 1 ? fr.x : 1.0 - fr.x) * (y == 1 ? fr.y : 1.0 - fr.y);
+				float wd = exp(-abs(tap.a - central.a) / max(0.1, central.a * 0.1)
+						- abs(tap.b - central.b) * 4.0);
+				acc += tap * (wb * wd);
+				ws += wb * wd;
+			}
+		}
+		cur = ws > 1e-5 ? acc / ws : central;
+	}
+	vec4 outv = cur;
+	// Refreshes this pixel's history holds, before this frame's own trace (0 after a reset).
+	float age = 0.0;
+	if (F.wind.w > 0.5) {
+		// The nearest cloud depth around, for pixels whose own ray found no cloud.
+		float near_cloud = 1e9;
+		// The same 3x3 as a depth- and opacity-aware tent average: the first estimate of a
+		// pixel the camera just brought on screen (#775), worth CT_AGE_PRIOR samples.
+		vec4 sp = vec4(0.0);
+		float spw = 0.0;
+		for (int y = -1; y <= 1; y++) {
+			for (int x = -1; x <= 1; x++) {
+				vec4 tap = texelFetch(ct_trace_tex, clamp(c + ivec2(x, y), ivec2(0), tsize - 1), 0);
+				if (tap.b < 0.999) {
+					near_cloud = min(near_cloud, tap.a);
+				}
+				vec2 dd = abs(vec2(c + ivec2(x, y)) - src);
+				float wt = max(1.5 - dd.x, 0.0) * max(1.5 - dd.y, 0.0)
+						* exp(-abs(tap.a - central.a) / max(0.1, central.a * 0.1) - abs(tap.b - central.b) * 4.0);
+				sp += tap * wt;
+				spw += wt;
+			}
+		}
+		sp = spw > 1e-5 ? sp / spw : cur;
+		// Revealed this frame (no history to carry): the tent estimate, blended with this
+		// pixel's own trace when it has one, counted as CT_AGE_PRIOR samples.
+		outv = fresh ? mix(central, sp, CT_AGE_PRIOR / (CT_AGE_PRIOR + 1.0)) : sp;
+		age = CT_AGE_PRIOR;
+		// Reproject by the cloud's own depth: the transmittance-weighted mean.
+		// An empty ray carries only its shell entry (0 inside the layer), so it
+		// borrows the nearest cloud around it.
+		float depth_km = cur.b < 0.999 ? cur.a : (near_cloud < 1e8 ? near_cloud : max(cur.a, 2.0));
+		vec2 uv = (vec2(p) + 0.5) / vec2(hsize);
+		// The cloud field drifted by F.wind.xz since the previous frame: what is at
+		// w now was at w - drift then.
+		vec3 w = F.cam_pos.xyz + ct_ray(uv) * max(depth_km * 1000.0, 1.0) - vec3(F.wind.x, 0.0, F.wind.z);
+		vec3 pr = ct_project_prev(w);
+		if (pr.z > 0.0 && all(greaterThanEqual(pr.xy, vec2(0.0))) && all(lessThanEqual(pr.xy, vec2(1.0)))) {
+			// THE HISTORY'S BOX: the min / max of the 3x3 traced this frame round a trace
+			// cell, INTERPOLATED between the four cells round this history pixel (clouds
+			// forming, 2026-11-13). It was the box of the NEAREST cell: one box for the
+			// 2 x 2 history pixels of a cell, jumping at every cell border. Where the field
+			// changes (at the weather's own 1/120 per s of cover a forming cell's edge
+			// crosses about a history pixel a frame) the stale history behind the edge is
+			// clamped to the box's edge, so the lit edge of every growing cloud came out in
+			// the boxes' own 4 px steps (--form-live). A traced pixel sits on a cell: its
+			// box is that cell's, as before.
+			ivec2 b0 = ivec2(floor(src));
+			vec2 fb = src - vec2(b0);
+			vec4 tp[16];
+			for (int y = 0; y < 4; y++) {
+				for (int x = 0; x < 4; x++) {
+					tp[y * 4 + x] = texelFetch(ct_trace_tex, clamp(b0 + ivec2(x - 1, y - 1), ivec2(0), tsize - 1), 0);
+				}
+			}
+			vec4 lo = vec4(0.0);
+			vec4 hi = vec4(0.0);
+			for (int j = 0; j < 2; j++) {
+				for (int i = 0; i < 2; i++) {
+					vec4 l = tp[j * 4 + i];
+					vec4 u = l;
+					for (int yy = 0; yy < 3; yy++) {
+						for (int xx = 0; xx < 3; xx++) {
+							vec4 t = tp[(j + yy) * 4 + i + xx];
+							l = min(l, t);
+							u = max(u, t);
+						}
+					}
+					float wb = (i == 1 ? fb.x : 1.0 - fb.x) * (j == 1 ? fb.y : 1.0 - fb.y);
+					lo += l * wb;
+					hi += u * wb;
+				}
+			}
+			vec4 h = clamp(ct_history(pr.xy, vec2(hsize)), lo, hi);
+			// A running MEAN until the history holds `retain`'s worth of samples:
+			// right after a reset (a camera cut, a resize) the history is one
+			// upsampled noisy frame, and a fixed 0.9 kept ~10 % of that noise for
+			// 20+ refreshes — the blotches after a jump. PER PIXEL (#775): k is this
+			// pixel's own count, carried with its history; the global count since the
+			// reset (F.march.z) held ~90 % of the first sample wherever a pan or a drive
+			// had just brought the sky on screen, a noisy band along the leading edge.
+			float k = textureLod(ct_age_prev, pr.xy, 0.0).r;
+			outv = fresh ? mix(cur, h, min(F.frame_b.z, k / (k + 1.0))) : h;
+			age = k;
+		}
+	}
+	outv = vec4(max(outv.rg, vec2(0.0)), clamp(outv.b, 0.0, 1.0), max(outv.a, 0.0));
+	imageStore(ct_hist_out, p, outv);
+	imageStore(ct_view_out, p, outv);
+	imageStore(ct_age_out, p, vec4(min(age + (fresh ? 1.0 : 0.0), 1024.0), 0.0, 0.0, 0.0));
+}
+
+#endif
+
+#ifdef KERNEL_VELOCITY
+
+// THE CLOUDS' MOTION VECTORS (#775). Without an upscaler Godot writes motion vectors in the opaque
+// pass, whose clear leaves (0, 0) wherever no geometry drew (render_forward_clustered.cpp:1921 and
+// :2309, 4.8-beta3): the sky, and the transparent sea. TAA then takes those pixels' history from
+// the SAME screen position while the camera turns, and its variance clip lets the old edge through
+// — every cloud ghosted and smeared whenever the camera moved. (With an upscaler the motion pass
+// clears to (-1, -1) instead: no history at all.) This writes, after the opaque pass and before
+// TAA reads the buffer, where each such pixel's content sat last frame: the open sky and the sea
+// beyond the horizon at infinity (the camera's rotation alone), the sea plane below the horizon
+// at its own distance, and the cloud at its history depth, drifted by the wind. A pixel takes
+// the motion of what SHOWS in it: over the smooth sky and sea a cloud edge is the only structure,
+// so the cloud's motion takes over by 15 % opacity (blended by opacity, a half-covered edge pixel
+// took the mean of the cloud's parallax and the sky's, and TAA fetched its history that much off;
+// a mid-deck drive's twinkle 0.18 -> 0.15 %); over textured geometry (the flight
+// quad) the cloud's motion takes over only where the cloud hides it, 30-70 % opacity. Godot's
+// convention: previous uv - current uv, un-jittered (scene_forward_clustered.glsl, MOTION_VECTORS).
+
+layout(set = 0, binding = 1) uniform sampler2D ct_depth_v;   // nearest, clamp
+layout(set = 0, binding = 2) uniform sampler2D ct_view_v;    // linear, clamp: this frame's history
+layout(rg16f, set = 0, binding = 3) uniform restrict image2D ct_velocity;
+
+void main() {
+	ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 full = ivec2(F.frame_a.xy);
+	if (q.x >= full.x || q.y >= full.y) {
+		return;
+	}
+	vec2 uv = (vec2(q) + 0.5) / vec2(full);
+	vec4 h = textureLod(ct_view_v, uv, 0.0);
+	float a = 1.0 - clamp(h.b, 0.0, 1.0);
+	float dz = texelFetch(ct_depth_v, q, 0).r;
+	bool geometry = dz > 0.0;
+	// UNDER DLSS GEOMETRY KEEPS ITS OWN MOTION (owner prompts/85, 2026-11-17: "for the clouds when DLSS is active look
+	// at clouds to terrain it shows a blue line"). Over a surface the cloud's motion took over at 30-70 % opacity; at the
+	// slope veil's contours on Fuji's cap that handed DLSS the drifting cloud's motion on terrain pixels, and DLSS took
+	// their history from beside the silhouette: single sky-blue pixels along every contour (with this kernel off, none;
+	// FSR2 and native showed none). F.march.w = 1 (CloudBridge: the viewport's scaling mode is DLSS).
+	if (geometry && F.march.w > 0.5) {
+		return;
+	}
+	if (geometry) {
+		// Geometry with no cloud in front keeps its own motion vector. The history also holds
+		// the cloud BEHIND a foreground object (the trace marches past it, cloud_trace_t_max):
+		// that cloud is farther than the surface, and is not in front of it either.
+		vec3 vv = vec3((2.0 * uv.x - 1.0) * F.cam_pos.w, (1.0 - 2.0 * uv.y) * F.cam_x.w, 1.0);
+		float t_scene = F.cam_z.w / (dz + F.cam_y.w) * length(vv);
+		if (a < 0.002 || h.a * 1000.0 >= t_scene) {
+			return;
+		}
+	}
+	vec3 rd = ct_ray(uv);
+	vec2 v = imageLoad(ct_velocity, q).xy;
+	if (!geometry) {
+		vec3 d = rd;
+		if (rd.y < 0.0 && F.cam_pos.y > 0.0) {
+			d = F.cam_pos.xyz + rd * (F.cam_pos.y / -rd.y) - F.prev_pos.xyz;   // the sea plane
+		}
+		vec3 pb = ct_project_prev_dir(d);
+		v = pb.z > 0.0 ? pb.xy - uv : vec2(0.0);
+	}
+	if (a >= 0.002) {
+		vec3 w = F.cam_pos.xyz + rd * max(h.a * 1000.0, 1.0) - vec3(F.wind.x, 0.0, F.wind.z);
+		vec3 pc = ct_project_prev(w);
+		if (pc.z > 0.0) {
+			v = mix(v, pc.xy - uv, geometry ? smoothstep(0.3, 0.7, a) : smoothstep(0.0, 0.15, a));
+		}
+	}
+	imageStore(ct_velocity, q, vec4(v, 0.0, 0.0));
+}
+
+#endif

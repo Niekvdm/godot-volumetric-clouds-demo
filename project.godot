@@ -1,0 +1,22 @@
+; Engine configuration file.
+
+config_version=5
+
+[application]
+
+config/name="Volumetric Clouds Demo"
+run/main_scene="res://demo/demo.tscn"
+config/features=PackedStringArray("4.8", "Forward Plus")
+
+[display]
+
+window/size/viewport_width=1600
+window/size/viewport_height=900
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/sky_3d/plugin.cfg")
+
+[rendering]
+
+anti_aliasing/quality/use_taa=true

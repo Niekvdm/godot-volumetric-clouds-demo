@@ -1,0 +1,4 @@
+# Godot
+.godot/
+*.tmp
+/addons/sky_3d/

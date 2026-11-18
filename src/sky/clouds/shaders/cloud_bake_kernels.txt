@@ -1,0 +1,288 @@
+// Cloud noise generation kernels (vanilla GLSL / Vulkan compute — compiled via
+// RenderingDevice.shader_compile_spirv_from_source, NOT Godot shading language).
+// every noise asset is generated procedurally on the GPU
+// at startup; these kernels do the same for our formerly-baked volumes:
+//   base    128^3 RGBA8 (+mip chain via mip3d) — R: Perlin-Worley, GBA:
+//           tileable Worley at 8/16/32 cells, all REMAPPED to the statistics
+//           the field code was tuned against (R: 0.67 ± 0.06; the
+//           0.5G+0.3B+0.2A billow sum: 0.48 ± 0.1055, the committed bake's).
+//   detail   32^3 RGBA8 (+mips) — Worley at 4/8/16 cells over its 512 m period:
+//           128/64/32 m puffs, 8/4/2 texels each (the bake config's cells). It
+//           was 8/16/32 until #771 — 16 m cells on 16 m texels, grain, not puffs.
+//   curl    128^2 RG8 — curl of a two-octave value-noise stream function.
+//   scatter 256^2 R8  — five-octave value-noise fbm (regional coverage).
+//   mip3d   — one 2x box-filter level step for a 3D volume.
+//   stats   — the raw base volume's mean / sd, for the remap (on the GPU: no readback, A4).
+// ONE kernel per compilation unit: cloud_bake.gd prepends `#define KERNEL_x`
+// and compiles the source once per kernel. Deterministic (fixed seed).
+// Headless note: no RenderingDevice there — the committed fallbacks load
+// instead (cloud_assets.gd owns that decision).
+
+#version 450
+
+// ---- tileable hashing / noise ----------------------------------------------
+
+float bk_hash(vec3 p) {
+	p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+	p += dot(p, p.yxz + 33.33);
+	return fract((p.x + p.y) * p.z);
+}
+float bk_hash2(vec2 p) {
+	vec3 q = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+	q += dot(q, q.yzx + 33.33);
+	return fract((q.x + q.y) * q.z);
+}
+vec3 bk_grad3(vec3 ip) {
+	float h = bk_hash(ip) * 6.2831853;
+	return vec3(cos(h), cos(h + 2.0944), cos(h + 4.1888));
+}
+
+// Tileable 3D gradient (Perlin) noise on a lattice of `per` cells.
+float bk_perlin(vec3 p, int per) {
+	vec3 i = floor(p);
+	vec3 f = p - i;
+	vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+	float a = dot(bk_grad3(mod(i, float(per))), f);
+	float b = dot(bk_grad3(mod(i + vec3(1, 0, 0), float(per))), f - vec3(1, 0, 0));
+	float c = dot(bk_grad3(mod(i + vec3(0, 1, 0), float(per))), f - vec3(0, 1, 0));
+	float d = dot(bk_grad3(mod(i + vec3(1, 1, 0), float(per))), f - vec3(1, 1, 0));
+	float e = dot(bk_grad3(mod(i + vec3(0, 0, 1), float(per))), f - vec3(0, 0, 1));
+	float g = dot(bk_grad3(mod(i + vec3(1, 0, 1), float(per))), f - vec3(1, 0, 1));
+	float h = dot(bk_grad3(mod(i + vec3(0, 1, 1), float(per))), f - vec3(0, 1, 1));
+	float k = dot(bk_grad3(mod(i + vec3(1, 1, 1), float(per))), f - vec3(1, 1, 1));
+	return mix(mix(mix(a, b, u.x), mix(c, d, u.x), u.y),
+			mix(mix(e, g, u.x), mix(h, k, u.x), u.y), u.z) * 1.4;
+}
+
+// Tileable Worley "1 - F1" on a lattice of `per` cells (high = puff centre).
+// SOFT falloff (smoothstep to zero by F1 ~ 1.25): the first cut clamped F1 at
+// 0.67 and every puff carried a flat plateau top — billows read as squashed
+// blobs, "unnatural". Soft puffs round off.
+float bk_worley(vec3 p, int per) {
+	vec3 i = floor(p);
+	vec3 f = p - i;
+	float f1 = 8.0;
+	for (int z = -1; z <= 1; z++)
+	for (int y = -1; y <= 1; y++)
+	for (int x = -1; x <= 1; x++) {
+		vec3 o = vec3(x, y, z);
+		vec3 ip = mod(i + o, float(per));
+		vec3 fp = o + vec3(bk_hash(ip), bk_hash(ip + 17.17), bk_hash(ip + 31.31)) - f;
+		f1 = min(f1, dot(fp, fp));
+	}
+	return 1.0 - smoothstep(0.0, 1.25, sqrt(f1));
+}
+
+// Tileable 2D value noise.
+float bk_value2(vec2 p, int per) {
+	vec2 i = floor(p);
+	vec2 f = p - i;
+	vec2 u = f * f * (3.0 - 2.0 * f);
+	float a = bk_hash2(mod(i, float(per)));
+	float b = bk_hash2(mod(i + vec2(1, 0), float(per)));
+	float c = bk_hash2(mod(i + vec2(0, 1), float(per)));
+	float d = bk_hash2(mod(i + vec2(1, 1), float(per)));
+	return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// ---- kernels (one per compilation unit via KERNEL_x defines) ----------------
+
+#ifdef KERNEL_BASE
+// RAW base volume (pre-remap): R = Perlin-Worley, GBA = Worley 8/16/32 cells.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(set = 0, binding = 0, rgba8) uniform restrict writeonly image3D img;
+layout(push_constant) uniform Pc { float seed; } pc;
+void main() {
+	ivec3 n = imageSize(img);
+	ivec3 c = ivec3(gl_GlobalInvocationID);
+	if (any(greaterThanEqual(c, n))) return;
+	vec3 uvw = (vec3(c) + 0.5) / vec3(n);
+	vec3 p = uvw * 16.0 + pc.seed;              // 16 lattice cells across
+	float wor = bk_worley(p, 16);
+	float per = bk_perlin(p, 16) * 0.5 + 0.5;   // Perlin-Worley remap
+	imageStore(img, c, vec4(mix(per, wor, 0.85),
+			bk_worley(uvw * 8.0 + pc.seed, 8),
+			bk_worley(uvw * 16.0 + pc.seed * 1.7, 16),
+			bk_worley(uvw * 32.0 + pc.seed * 2.3, 32)));
+}
+#endif
+
+#ifdef KERNEL_REMAP
+// Bring R and the GBA billow sum to the committed bake's measured statistics
+// (cloud_field.gdshaderinc's CLOUD_BILLOW_MEAN/SD and its "0.67 ± 0.06" note),
+// so the tuned field behaves identically on a procedural volume.
+// The measured statistics come from KERNEL_STATS through a storage buffer (A4, 2026-11-15: they
+// were read back to the CPU and pushed as constants).
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(set = 0, binding = 0, rgba8) uniform restrict image3D remap_img;
+// (R mean, R sd, billow-sum mean, billow-sum sd) of the raw volume.
+layout(set = 0, binding = 1, std430) restrict readonly buffer RemapStats { vec4 st; } rs;
+void main() {
+	ivec3 c = ivec3(gl_GlobalInvocationID);
+	if (any(greaterThanEqual(c, imageSize(remap_img)))) return;
+	vec4 v = imageLoad(remap_img, c);
+	float r = clamp((v.r - rs.st.x) / max(rs.st.y, 1e-4) * 0.06 + 0.67, 0.0, 1.0);
+	float s = v.g * 0.5 + v.b * 0.3 + v.a * 0.2;
+	float s2 = clamp((s - rs.st.z) / max(rs.st.w, 1e-4) * 0.1055 + 0.48, 0.0, 1.0);
+	// OFFSET the channels by the sum's correction times each channel's weight.
+	// The first cut scaled channels by the RATIO s2/s — up to 10x amplification
+	// in empty lattice corners, salt-and-pepper speckle the erosion then carved
+	// into unnatural crumb. An offset of d * w_i moves the weighted sum by
+	// d * sum(w_i^2) (0.38 for 0.5 / 0.3 / 0.2), so divide by it: until #771
+	// the sum landed at 0.557 +- 0.121 instead of its 0.48 +- 0.117, and every
+	// GPU billow bulged ~0.66 sd (~100 m) outward of the twin's.
+	float d = (s2 - s) / 0.38;
+	imageStore(remap_img, c, vec4(r,
+			clamp(v.g + d * 0.5, 0.0, 1.0),
+			clamp(v.b + d * 0.3, 0.0, 1.0),
+			clamp(v.a + d * 0.2, 0.0, 1.0)));
+}
+#endif
+
+#ifdef KERNEL_STATS
+// The raw base volume's statistics, exactly as CloudBake._stats takes them on the CPU: every 16th
+// texel in linear (x fastest) order, R and the 0.5G + 0.3B + 0.2A billow sum, mean and sd of each,
+// into the buffer KERNEL_REMAP reads. One workgroup of 256 (131 k loads), a shared-memory sum.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, rgba8) uniform restrict readonly image3D st_img;
+layout(set = 0, binding = 1, std430) restrict writeonly buffer StatsOut { vec4 st; } so;
+shared vec4 st_acc[256];
+void main() {
+	ivec3 n = imageSize(st_img);
+	int total = n.x * n.y * n.z;
+	uint li = gl_LocalInvocationID.x;
+	vec4 a = vec4(0.0);   // sum r, r^2, s, s^2
+	for (int t = int(li) * 16; t < total; t += 256 * 16) {
+		ivec3 c = ivec3(t % n.x, (t / n.x) % n.y, t / (n.x * n.y));
+		vec4 v = imageLoad(st_img, c);
+		float s = 0.5 * v.g + 0.3 * v.b + 0.2 * v.a;
+		a += vec4(v.r, v.r * v.r, s, s * s);
+	}
+	st_acc[li] = a;
+	barrier();
+	for (uint k = 128u; k > 0u; k >>= 1u) {
+		if (li < k) {
+			st_acc[li] += st_acc[li + k];
+		}
+		barrier();
+	}
+	if (li == 0u) {
+		vec4 m = st_acc[0] / float((total + 15) / 16);
+		so.st = vec4(m.x, sqrt(max(m.y - m.x * m.x, 1e-8)), m.z, sqrt(max(m.w - m.z * m.z, 1e-8)));
+	}
+}
+#endif
+
+#ifdef KERNEL_PFNOISE
+// THE PROCEDURAL FIELD'S NOISE (B2, CLOUDS2): one cloud volume,
+// 128^3 RGBA8 tiling: R = 5-octave Perlin fBm mixed 0.3 with a Worley
+// fBm, G/B/A = 3-octave Worley fBm at 8/16/32 cells. Its field (cloud_pf_field.gdshaderinc) is tuned
+// against these statistics (fbm ~0.62), so they are its own and NOT remapped like the base volume.
+// Hash: PCG3D (Jarzynski & Olano 2020) on the integer lattice cell and the octave's frequency, never
+// a fract(sin(x) * 43758.5453) hash: sin's precision differs between GPU vendors, and every
+// peer must grow the same volume (multiplayer: the clouds are shared state).
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(set = 0, binding = 0, rgba8) uniform restrict writeonly image3D pf_img;
+layout(push_constant) uniform Pc6 { float seed; } pc6;
+
+uvec3 pf_pcg3d(uvec3 v) {
+	v = v * 1664525u + 1013904223u;
+	v.x += v.y * v.z;
+	v.y += v.z * v.x;
+	v.z += v.x * v.y;
+	v ^= v >> 16u;
+	v.x += v.y * v.z;
+	v.y += v.z * v.x;
+	v.z += v.x * v.y;
+	return v;
+}
+
+// Three uniform numbers in [0, 1) for an integer lattice cell at an octave's frequency.
+vec3 pf_h3(ivec3 cell, int freq) {
+	uvec3 h = pf_pcg3d(uvec3(cell) + uvec3(uint(freq) * 7919u, uint(freq) * 104729u, uint(pc6.seed)));
+	return vec3(h >> 8u) / 16777216.0;
+}
+
+ivec3 pf_wrap(ivec3 c, int freq) {
+	return ((c % freq) + freq) % freq;
+}
+
+float pf_worley(vec3 p, int freq) {
+	vec3 x = p * float(freq);
+	vec3 c = floor(x);
+	vec3 f = x - c;
+	float md = 1.0;
+	for (int k = -1; k <= 1; k++) {
+		for (int j = -1; j <= 1; j++) {
+			for (int i = -1; i <= 1; i++) {
+				ivec3 o = ivec3(i, j, k);
+				vec3 d = vec3(o) + pf_h3(pf_wrap(ivec3(c) + o, freq), freq) - f;
+				md = min(md, dot(d, d));
+			}
+		}
+	}
+	return 1.0 - clamp(sqrt(md), 0.0, 1.0);
+}
+
+vec3 pf_grad(ivec3 cell, int freq) {
+	return normalize(pf_h3(pf_wrap(cell, freq), freq + 1000) * 2.0 - 1.0);
+}
+
+float pf_perlin(vec3 p, int freq) {
+	vec3 x = p * float(freq);
+	vec3 c = floor(x);
+	vec3 f = x - c;
+	vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+	float v = 0.0;
+	for (int k = 0; k <= 1; k++) {
+		for (int j = 0; j <= 1; j++) {
+			for (int i = 0; i <= 1; i++) {
+				vec3 o = vec3(float(i), float(j), float(k));
+				float w = mix(1.0 - u.x, u.x, o.x) * mix(1.0 - u.y, u.y, o.y) * mix(1.0 - u.z, u.z, o.z);
+				v += w * dot(pf_grad(ivec3(c) + ivec3(i, j, k), freq), f - o);
+			}
+		}
+	}
+	return v;
+}
+
+float pf_wfbm(vec3 p, int f) {
+	return pf_worley(p, f) * 0.625 + pf_worley(p, f * 2) * 0.25 + pf_worley(p, f * 4) * 0.125;
+}
+
+void main() {
+	ivec3 n = imageSize(pf_img);
+	ivec3 id = ivec3(gl_GlobalInvocationID);
+	if (any(greaterThanEqual(id, n))) return;
+	vec3 p = (vec3(id) + 0.5) / vec3(n);
+	float pf = 0.0;
+	float a = 0.5;
+	int f = 4;
+	for (int i = 0; i < 5; i++) {
+		pf += a * pf_perlin(p, f);
+		a *= 0.5;
+		f *= 2;
+	}
+	float per = clamp(pf * 1.1 + 0.5, 0.0, 1.0);
+	float w0 = pf_wfbm(p, 4);
+	imageStore(pf_img, id, vec4(mix(per, w0, 0.3), pf_wfbm(p, 8), pf_wfbm(p, 16), pf_wfbm(p, 32)));
+}
+#endif
+
+#ifdef KERNEL_MIP3D
+// One 2x box-filter mip step (previous level sampled, next written; the
+// driver dispatches once per level with barriers between).
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(set = 0, binding = 0, rgba8) uniform restrict writeonly image3D mip_dst;
+layout(set = 0, binding = 1, rgba8) uniform restrict readonly image3D mip_src;
+void main() {
+	ivec3 c = ivec3(gl_GlobalInvocationID);
+	if (any(greaterThanEqual(c, imageSize(mip_dst)))) return;
+	vec4 v = 0.125 * (
+		imageLoad(mip_src, c * 2 + ivec3(0, 0, 0)) + imageLoad(mip_src, c * 2 + ivec3(1, 0, 0)) +
+		imageLoad(mip_src, c * 2 + ivec3(0, 1, 0)) + imageLoad(mip_src, c * 2 + ivec3(1, 1, 0)) +
+		imageLoad(mip_src, c * 2 + ivec3(0, 0, 1)) + imageLoad(mip_src, c * 2 + ivec3(1, 0, 1)) +
+		imageLoad(mip_src, c * 2 + ivec3(0, 1, 1)) + imageLoad(mip_src, c * 2 + ivec3(1, 1, 1)));
+	imageStore(mip_dst, c, v);
+}
+#endif
