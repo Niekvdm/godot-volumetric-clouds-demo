@@ -153,4 +153,4 @@ were developed with Claude (Anthropic), directed, reviewed and tested by the dev
 
 ## License
 
-MIT, see `LICENSE`. Sky3D keeps its own MIT licence in `addons/sky_3d/`.
+MIT, see `LICENSE`. Credits in `CREDITS.md`. Sky3D keeps its own MIT licence in `addons/sky_3d/`.
